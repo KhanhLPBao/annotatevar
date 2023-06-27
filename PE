@@ -1,0 +1,227 @@
+import json
+haploconfigfile = "haploconfig.json"
+
+S=[f'filterfq/in/{m}.fastq.gz' for m in config['SAMPLES']]
+
+with open(haploconfigfile) as haplostats:
+    a = json.loads(haplostats.read())
+    snpfilter = a['snpfilter']
+    indelfilter = a['indelfilter']
+    haplostats.close()
+
+
+varitype = ['SNP','INDEL']
+filterstats = {'SNP':snpfilter, 'INDEL':indelfilter}
+
+rule export:
+    input:
+        "output/out.csv"
+
+rule filterfqPE:
+    input:
+        in1 = S[0],
+        in2 = S[1]
+    output:
+        out1 = "filterfq/out/1.fastq.gz",
+        out2 = "filterfq/out/2.fastq.gz"
+    shell:
+        "fastp -w 8 -A -i {input.in1} -I {input.in2} -o {output.out1} -O {output.out2}"
+
+rule align:
+    input:
+        in1 = "filterfq/out/1.fastq.gz",
+        in2 = "filterfq/out/2.fastq.gz",
+        ref = "ref/fasta/GRCh38.fa"
+    output:
+        "align/align.sam"
+
+    shell:
+        "bwa mem -t 8 -R '@RG\\tID:test\\tSM:test\\tPL:MGI_SEQ_PE' {input.ref} {input.in1} {input.in2} > {output}"
+
+rule postalignprocess:
+    input:
+        sam = "align/align.sam",
+        ref = "ref/fasta/GRCh38.fa"
+    output:
+        bam = "postalignprocess/dedup.bam",
+    log:
+        "postalignprocess/log/process"
+    shell:
+        "samtools view -@ 8 -b -F 4 -q 20 {input.sam} | samtools sort -@ 8 > {output.bam}; samtools index -@ 8 {output.bam}"
+
+rule markdup:
+    input:
+        ref = "ref/fasta/GRCh38.fa",
+        bam = "postalignprocess/dedup.bam"
+    output:
+        "markdup/markdup.bam"
+    log:
+        "markdup/log/markdup"
+    shell:
+        "gatk MarkDuplicates -I {input.bam} -R {input.ref} -O {output} -M postalignprocess/M.txt ; samtools index -@ 8 {output}"
+
+rule firstvcf:
+    input:
+        fasta = "ref/fasta/GRCh38.fa",
+        inbam = "markdup/markdup.bam"
+    output:
+        "first/raw.vcf"
+    shell:
+        'gatk --java-options "-Xmx8g" HaplotypeCaller \
+        -R {input.fasta} \
+        -I {input.inbam} \
+        -O {output}'
+
+rule firstextract:
+    input:
+        fasta = "ref/fasta/GRCh38.fa",
+        vcf = 'first/raw.vcf'
+    params:
+        "{vartype}"
+    output:
+        'first/{vartype}.vcf'
+    wildcard_constraints:
+        vartype='[^(all)][0-9a-zA-Z]*'
+    shell:
+        'gatk --java-options "-Xmx8g" SelectVariants \
+        -R {input.fasta} \
+        -V {input.vcf} \
+        -O {output} \
+        --select-type-to-include {params}'  
+
+rule firstfilter:    
+    input:
+        fasta = "ref/fasta/GRCh38.fa",
+        vcf = 'first/{vartype}.vcf'
+    params: 
+        parameter = lambda v: filterstats[v.vartype]
+    output:
+        "first/{vartype}.filtered.vcf"
+    shell:   
+        'gatk --java-options "-Xmx8g" VariantFiltration \
+        -R {input.fasta} \
+        -V {input.vcf} \
+        -O {output} \
+        {params.parameter}'
+
+rule exclude:
+    input:
+        fasta = "ref/fasta/GRCh38.fa",
+        vcf = "first/{vartype}.filtered.vcf"        
+    output:
+        'first/{vartype}.filtered.exclude.vcf'
+    shell:
+        'gatk --java-options "-Xmx8g" SelectVariants \
+        -R {input.fasta} \
+        -V {input.vcf} \
+        -O {output} \
+        --exclude-filtered'
+
+rule baserecalib:
+    input:
+        fasta = "ref/fasta/GRCh38.fa",
+        vcf = expand('first/{vartype}.filtered.exclude.vcf', vartype = varitype),
+        bam = "markdup/markdup.bam"
+    params:
+        a = expand('--known-sites first/{vartype}.filtered.exclude.vcf', vartype = varitype)
+    output:
+        "recalib/stats.table"
+    shell:
+        'gatk --java-options "-Xmx8g" BaseRecalibrator \
+        -R {input.fasta} \
+        -I {input.bam} \
+        -O {output} \
+        {params.a}'
+
+rule applyrecalib:
+    input:
+        fasta = "ref/fasta/GRCh38.fa",
+        table = "recalib/stats.table",
+        bam = "markdup/markdup.bam"
+    output:
+        "recalib/second.bam"
+    shell:
+        "gatk --java-options \"-Xmx8g\" ApplyBQSR\
+        -R {input.fasta} \
+        -I {input.bam} \
+        -bqsr {input.table} \
+        -O {output}"
+
+rule secondvcf:
+    input:
+        fasta = "ref/fasta/GRCh38.fa",
+        bam = "recalib/second.bam"
+    output:
+        "second/raw.vcf"
+    shell:
+        "gatk --java-options \"-Xmx8g\" HaplotypeCaller \
+        -R {input.fasta} \
+        -I {input.bam} \
+        -O {output}"
+
+rule secondextract:
+    input:
+        fasta = "ref/fasta/GRCh38.fa",
+        vcf = "second/raw.vcf"
+    wildcard_constraints:
+        vartype2='[^(all)][0-9a-zA-Z]*'        
+    params:
+        "{vartype2}"
+    output:
+        "second/{vartype2}.vcf"
+    shell:
+        'gatk --java-options "-Xmx8g" SelectVariants \
+        -R {input.fasta} \
+        -V {input.vcf} \
+        -O {output} \
+        --select-type-to-include {params}'
+
+rule secondfilter:
+    input:
+        fasta = "ref/fasta/GRCh38.fa",
+        vcf = "second/{vartype2}.vcf"
+    params: 
+        parameter = lambda e: filterstats[e.vartype2]
+    wildcard_constraints:
+        vartype2='[^(all)][0-9a-zA-Z]*'        
+    output:
+        "second/{vartype2}.filtered.vcf"
+    shell:
+        ' gatk --java-options "-Xmx8g" VariantFiltration \
+        -R {input.fasta} \
+        -V {input.vcf} \
+        -O {output} \
+        {params.parameter}'
+
+rule annotate:
+    input:
+        fasta = "ref/fasta/GRCh38.fa",
+        clinvar = 'ref/variant/ClinVar{vartype2}.vcf',
+        vcf = "second/{vartype2}.filtered.vcf",
+        bam = "recalib/second.bam"
+    output:
+        "annotate/{vartype2}.annotate.vcf"
+    shell:
+        'gatk --java-options "-Xmx8g" VariantAnnotator \
+        -R {input.fasta} \
+        -I {input.bam} \
+        -V {input.vcf} \
+        -O {output} \
+        --dbsnp {input.clinvar} \
+        --resource:ref {input.clinvar} -E ref.CLNSIG'
+
+rule postannotatefilter:
+    input:
+        "annotate/{vartype2}.annotate.vcf"
+    output:
+        "annotate/{vartype2}.final.vcf"
+    shell:
+        "grep -v \"#\" {input} | awk '$3 !~ /\\./' > {output}"
+
+rule compress_results:
+    input:
+        data = expand("annotate/{vartype2}.final.vcf", vartype2=varitype)
+    output:
+        "output/out.csv",
+    script:
+        "extract.py"
