@@ -1,0 +1,4 @@
+{
+    "snpfilter": "--filter-name 'QD_filter' -filter 'QD < 2.0' --filter-name 'FS_filter' -filter 'FS > 60.0' --filter-name 'MQ_filter' -filter 'MQ < 40.0' --filter-name 'SOR_filter' -filter 'SOR > 4.0' --filter-name 'MQRankSum_filter' -filter 'MQRankSum < -12.5' --filter-name 'ReadPosRankSum_filter' -filter 'ReadPosRankSum < -8.0' --filter-name 'Coverage_filter' -filter 'DP < 60.0'",
+    "indelfilter": "--filter-name 'QD_filter' -filter 'QD < 2.0' --filter-name 'FS_filter' -filter 'FS > 200.0' --filter-name 'SOR_filter' -filter 'SOR > 10.0'"
+}
