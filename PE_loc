@@ -1,0 +1,323 @@
+import json
+haploconfigfile = "haploconfig.json"
+regionfile = config['REGION']
+S=[f'filterfq/in/{m}.fastq.gz' for m in config['SAMPLES']]
+
+with open(haploconfigfile) as haplostats:
+    a = json.loads(haplostats.read())
+    snpfilter = a['snpfilter']
+    indelfilter = a['indelfilter']
+    haplostats.close()
+
+varitype = ['SNP','INDEL']
+filterstats = {'SNP':snpfilter, 'INDEL':indelfilter}
+
+clinvarref = ['ClinvarSNP','ClinvarINDEL']
+rule export:
+    input:
+        "output/out.csv"
+
+rule recgionconfig:
+    input:
+        regionfile
+    output:
+        sam_gatk_region = "align2/region.bed",
+        bcf_region = "align2/bcfregion.bed",
+        annotation_config = "align2/anno.json"
+    script:
+        "regionprocess.py"
+
+rule prepareref:
+    input:
+        fasta = "ref/fasta/GRCh38.fa",
+        region = "align2/region.bed"
+    output:
+        reg = "align2/ref.fa"
+    shell:
+        "samtools faidx {input.fasta} -r {input.region} > {output.reg}"
+
+rule variantrefextract:
+    input:
+        raw = "ref/variant/ClinVar{vartype2}.vcf.gz",
+        bed = "align2/bcfregion.bed"
+    output:
+        extracted = "ref/align2/extractedClinVar{vartype2}.vcf"
+    shell:
+        "bcftools view --thread 8 {input.raw} -R {input.bed} > {output}"
+
+rule variant_coords_anno:
+    input:
+        ref = "ref/align2/extractedClinVar{vartype2}.vcf",
+        anno = "align2/anno.json",
+        filename = "ref/align2/extractedClinVar{vartype2}.vcf"
+    output:
+        "align2/extractedClinVar{vartype2}.anno.vcf"
+    shell:
+        "python refanno_vcf.py {input.filename}"
+
+rule reconfigref:
+    input:
+        fasta = "align2/ref.fa",
+        region = regionfile
+    output:
+        fasta = "align2/ref_anno.fa"
+    script:
+        "refanno_fa.py"
+
+rule indexref:
+    input:
+        "align2/ref_anno.fa"
+    output:
+        "align2/ref_anno.fa.bwt"
+    shell:
+        "bwa index {input}"
+
+rule filterfqPE:
+    input:
+        in1 = S[0],
+        in2 = S[1]
+    output:
+        out1 = "filterfq/out/1.fastq.gz",
+        out2 = "filterfq/out/2.fastq.gz"
+    shell:
+        "fastp -w 8 -A -i {input.in1} -I {input.in2} -o {output.out1} -O {output.out2}"
+
+rule align:
+    input:
+        in1 = "filterfq/out/1.fastq.gz",
+        in2 = "filterfq/out/2.fastq.gz",
+        ref = "ref/fasta/GRCh38.fa"
+    output:
+        "align/align.sam"
+    shell:
+        "bwa mem -t 8 -R '@RG\\tID:test\\tSM:test\\tPL:MGI_SEQ_PE' {input.ref} {input.in1} {input.in2} > {output}"
+
+rule postalignprocess:
+    input:
+        sam = "align/align.sam",
+        ref = "ref/fasta/GRCh38.fa"
+    output:
+        bam = "postalignprocess/dedup.bam",
+    log:
+        "postalignprocess/log/process"
+    shell:
+        "samtools view -@ 8 -b -F 4 -q 20 {input.sam} | samtools sort -@ 8 > {output.bam}; samtools index -@ 8 {output.bam}"
+
+rule markdup:
+    input:
+        ref = "ref/fasta/GRCh38.fa",
+        bam = "postalignprocess/dedup.bam"
+    output:
+        "markdup/markdup.bam"
+    log:
+        "markdup/log/markdup"
+    shell:
+        "gatk MarkDuplicates -I {input.bam} -R {input.ref} -O {output} -M postalignprocess/M.txt ; samtools index -@ 8 {output}"
+
+rule extractseqatregion:
+    input:
+        bam = "postalignprocess/dedup.bam",
+        region = "align2/region.bed"
+    output:
+        fasta1 = "align2/fasta_1.fa",
+        fasta2 = "align2/fasta_2.fa"
+    shell:
+        "samtools view -@ 8 {input.bam} -R {input.region} > align2/extracted.bam ; samtools index -@ 8 align2/extracted.bam ; samtools fasta -@ 8 -1 {output.fasta1} -2 {output.fasta2} -n align2/extracted.bam"
+
+rule filterextractedfasta:
+    input:
+        fasta1 = "align2/fasta_1.fa",
+        fasta2 = "align2/fasta_2.fa"
+    output:
+        "align2/fasta1_filtered.fa",
+        "align2/fasta2_filtered.fa"
+    script:
+        "filterfasta.py"
+
+rule realign:
+    input:
+        fasta1 = "align2/fasta1_filtered.fa",
+        fasta2 = "align2/fasta2_filtered.fa",
+        ref = "align2/ref_anno.fa",  
+        refindex = "align2/ref_anno.fa.bwt",
+    output:
+        "align2/realign.sam"
+    shell:
+        "bwa mem -t 8 -R '@RG\\tID:test\\tSM:test\\tPL:MGI_SEQ_PE' {input.ref} {input.fasta1} {input.fasta2} > {output}"
+
+rule realign_postprocess:
+    input:
+        ref = "align2/ref_anno.fa",  
+        sam = "align2/realign.sam"
+    output:
+        "markdup/realign.bam"
+    shell:
+        "\
+        samtools view -@ 8 -b -F 4 {input.sam} | samtools sort -@ 8 > postalignprocess/realign_temp.bam;\
+        gatk MarkDuplicates -I postalignprocess/realign_temp.bam -R {input.ref} -M postalignprocess/M.txt -O {output}\
+        "
+rule firstvcf:
+    input:
+        fasta = "align2/ref_anno.fa",
+        inbam = "markdup/realign.bam"
+    output:
+        "first/raw.vcf"
+    shell:
+        'gatk --java-options "-Xmx8g" HaplotypeCaller \
+        -R {input.fasta} \
+        -I {input.inbam} \
+        -O {output}'
+
+rule firstextract:
+    input:
+        fasta = "align2/ref_anno.fa",
+        vcf = 'first/raw.vcf'
+    params:
+        "{vartype}"
+    output:
+        'first/{vartype}.vcf'
+    wildcard_constraints:
+        vartype='[^(all)][0-9a-zA-Z]*'
+    shell:
+        'gatk --java-options "-Xmx8g" SelectVariants \
+        -R {input.fasta} \
+        -V {input.vcf} \
+        -O {output} \
+        --select-type-to-include {params}'  
+
+rule firstfilter:    
+    input:
+        fasta = "align2/ref_anno.fa",
+        vcf = 'first/{vartype}.vcf'
+    params: 
+        parameter = lambda v: filterstats[v.vartype]
+    output:
+        "first/{vartype}.filtered.vcf"
+    shell:   
+        'gatk --java-options "-Xmx8g" VariantFiltration \
+        -R {input.fasta} \
+        -V {input.vcf} \
+        -O {output} \
+        {params.parameter}'
+
+rule exclude:
+    input:
+        fasta = "align2/ref_anno.fa",
+        vcf = "first/{vartype}.filtered.vcf"        
+    output:
+        'first/{vartype}.filtered.exclude.vcf'
+    shell:
+        'gatk --java-options "-Xmx8g" SelectVariants \
+        -R {input.fasta} \
+        -V {input.vcf} \
+        -O {output} \
+        --exclude-filtered'
+
+rule baserecalib:
+    input:
+        fasta = "align2/ref_anno.fa",
+        vcf = expand('first/{vartype}.filtered.exclude.vcf', vartype = varitype),
+        bam = "markdup/realign.bam"
+    params:
+        a = expand('--known-sites first/{vartype}.filtered.exclude.vcf', vartype = varitype)
+    output:
+        "recalib/stats.table"
+    shell:
+        'gatk --java-options "-Xmx8g" BaseRecalibrator \
+        -R {input.fasta} \
+        -I {input.bam} \
+        -O {output} \
+        {params.a}'
+
+rule applyrecalib:
+    input:
+        fasta = "align2/ref_anno.fa",
+        table = "recalib/stats.table",
+        bam = "markdup/realign.bam"
+    output:
+        "recalib/second.bam"
+    shell:
+        "gatk --java-options \"-Xmx8g\" ApplyBQSR\
+        -R {input.fasta} \
+        -I {input.bam} \
+        -bqsr {input.table} \
+        -O {output}"
+
+rule secondvcf:
+    input:
+        fasta = "align2/ref_anno.fa",
+        bam = "recalib/second.bam"
+    output:
+        "second/raw.vcf"
+    shell:
+        "gatk --java-options \"-Xmx8g\" HaplotypeCaller \
+        -R {input.fasta} \
+        -I {input.bam} \
+        -O {output}"
+
+rule secondextract:
+    input:
+        fasta = "align2/ref_anno.fa",
+        vcf = "second/raw.vcf"
+    wildcard_constraints:
+        vartype2='[^(all)][0-9a-zA-Z]*'        
+    params:
+        "{vartype2}"
+    output:
+        "second/{vartype2}.vcf"
+    shell:
+        'gatk --java-options "-Xmx8g" SelectVariants \
+        -R {input.fasta} \
+        -V {input.vcf} \
+        -O {output} \
+        --select-type-to-include {params}'
+
+rule secondfilter:
+    input:
+        fasta = "align2/ref_anno.fa",
+        vcf = "second/{vartype2}.vcf"
+    params: 
+        parameter = lambda e: filterstats[e.vartype2]
+    wildcard_constraints:
+        vartype2='[^(all)][0-9a-zA-Z]*'        
+    output:
+        "second/{vartype2}.filtered.vcf"
+    shell:
+        ' gatk --java-options "-Xmx8g" VariantFiltration \
+        -R {input.fasta} \
+        -V {input.vcf} \
+        -O {output} \
+        {params.parameter}'
+
+rule annotate:
+    input:
+        fasta = "align2/ref_anno.fa",
+        clinvar = 'align2/extractedClinVar{vartype2}.anno.vcf',
+        vcf = "second/{vartype2}.filtered.vcf",
+        bam = "recalib/second.bam"
+    output:
+        "annotate/{vartype2}.annotate.vcf"
+    shell:
+        'gatk --java-options "-Xmx8g" VariantAnnotator \
+        -R {input.fasta} \
+        -I {input.bam} \
+        -V {input.vcf} \
+        -O {output} \
+        --dbsnp {input.clinvar} \
+        --resource:ref {input.clinvar} -E ref.CLNSIG'
+
+rule postannotatefilter:
+    input:
+        "annotate/{vartype2}.annotate.vcf"
+    output:
+        "annotate/{vartype2}.final.vcf"
+    shell:
+        "grep -v \"#\" {input} | awk '$3 !~ /\\./' > {output}"
+
+rule compress_results:
+    input:
+        data = expand("annotate/{vartype2}.final.vcf", vartype2=varitype)
+    output:
+        "output/out.csv",
+    script:
+        "extract.py"
